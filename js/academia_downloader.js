@@ -81,6 +81,10 @@ app.registerExtension({
                         .asd-switch input:checked + .asd-slider:before { transform: translateX(14px); background-color: white; }
                         
                         .asd-dl-row { display: flex; gap: 8px; align-items: center; background: #333; padding: 5px; border-radius: 4px; transition: opacity 0.2s; border: 2px solid transparent;}
+                        .asd-speed { flex: 0 0 100px; width: 100px; min-width: 100px; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-align: right; font-size: 12px; font-variant-numeric: tabular-nums; color: #ccc; }
+                        .asd-progress { position: relative; width: 65px; flex-shrink: 0; align-self: stretch; margin-block: -5px; overflow: hidden; background: #171717; border-inline: 1px solid #555; }
+                        .asd-progress-fill { position: absolute; inset: 0 auto 0 0; width: 0%; background: #287c46; transition: width .2s; }
+                        .asd-progress-label { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold; text-shadow: 0 1px 2px #000; }
                         .asd-dl-row.disabled { opacity: 0.5; }
                         .asd-dl-row.drag-over-top { border-top: 4px solid #00ff00; }
                         .asd-dl-row.drag-over-bottom { border-bottom: 4px solid #00ff00; }
@@ -174,6 +178,24 @@ app.registerExtension({
                     };
                 };
 
+                const setSpeed = (row, bytesPerSecond = 0) => {
+                    const speed = row.querySelector(".asd-speed");
+                    const text = Number.isFinite(bytesPerSecond) && bytesPerSecond >= 0
+                        ? `${(bytesPerSecond / 1000000).toFixed(2)} MB/s` : "— MB/s";
+                    speed.textContent = text;
+                    speed.title = text;
+                };
+
+                const setProgress = (progress, value) => {
+                    const known = Number.isFinite(value) && value >= 0;
+                    const percent = known ? Math.max(0, Math.min(100, Math.round(value))) : 0;
+                    progress.querySelector(".asd-progress-fill").style.width = `${percent}%`;
+                    progress.querySelector(".asd-progress-label").textContent = known ? `${percent}%` : "…";
+                    if (known) progress.setAttribute("aria-valuenow", String(percent));
+                    else progress.removeAttribute("aria-valuenow");
+                    progress.setAttribute("aria-valuetext", known ? `${percent}%` : "Downloading…");
+                };
+
                 const checkRowStatus = async (row) => {
                     const payload = getRowPayload(row);
                     if(!payload.url || payload.url === "none") return;
@@ -209,10 +231,10 @@ app.registerExtension({
                         const cli = row.querySelector(".asd-cli-btn");
                         const progress = row.querySelector(".asd-progress");
                         cli.disabled = Boolean(data.exists || data.is_downloading);
-                        progress.hidden = !(data.exists || data.is_downloading);
-                        if (data.exists) progress.value = 100;
-                        else if (data.is_downloading && data.progress > 0) progress.value = data.progress;
-                        else progress.removeAttribute("value");
+                        setSpeed(row, data.is_downloading ? (data.speed_bps ?? null) : 0);
+                        if (data.exists) setProgress(progress, 100);
+                        else if (data.is_downloading) setProgress(progress, data.progress);
+                        else setProgress(progress, 0);
                         if (data.exists) {
                             led.style.backgroundColor = "#00ff00"; led.title = `Ready: ${data.filename}`;
                             btn.innerText = "Completed"; btn.disabled = true; btn.style.background = "#008800";
@@ -254,13 +276,13 @@ app.registerExtension({
                     const payload = { ...getRowPayload(row), method };
                     if (!payload.url || payload.url === "none") return;
                     row.downloadBusy = true;
+                    setSpeed(row);
                     const btn = row.querySelector(".asd-dl-btn");
                     const cli = row.querySelector(".asd-cli-btn");
                     const progress = row.querySelector(".asd-progress");
                     btn.innerText = "⏳ Starting...";
                     btn.disabled = cli.disabled = true;
-                    progress.hidden = false;
-                    progress.removeAttribute("value");
+                    setProgress(progress, 0);
                     try {
                         const response = await fetch("/academia/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
                         const result = await response.json();
@@ -268,7 +290,7 @@ app.registerExtension({
                             row.downloadBusy = false;
                             btn.disabled = cli.disabled = false;
                             btn.innerText = "Download";
-                            progress.hidden = true;
+                            setProgress(progress, 0);
                             showHfInstallDialog();
                             return;
                         }
@@ -279,7 +301,7 @@ app.registerExtension({
                             if (data?.is_downloading) setTimeout(poll, 1000);
                             else {
                                 row.downloadBusy = false;
-                                if (!data) { btn.disabled = cli.disabled = false; progress.hidden = true; }
+                                if (!data) { btn.disabled = cli.disabled = false; setProgress(progress, 0); setSpeed(row); }
                             }
                         };
                         await poll();
@@ -287,8 +309,9 @@ app.registerExtension({
                         row.downloadBusy = false;
                         btn.disabled = cli.disabled = false;
                         btn.innerText = "Retry";
-                        progress.hidden = true;
+                        setProgress(progress, 0);
                         row.querySelector(".asd-led").title = e.message;
+                        setSpeed(row);
                         alert(e.message);
                     }
                 };
@@ -336,7 +359,11 @@ app.registerExtension({
                         <input type="text" class="subfolder-input asd-input" placeholder="Subfolder" value="${savedSubfolder}" style="flex: 1;">
                         <button class="asd-btn asd-dl-btn" style="background: #225588;">Download</button>
                         <button class="asd-btn asd-cli-btn" title="Download using Hugging Face CLI">cli</button>
-                        <progress class="asd-progress" max="100" hidden style="width: 65px; flex-shrink: 0;" aria-label="Download progress"></progress>
+                        <div class="asd-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Download progress">
+                            <div class="asd-progress-fill"></div>
+                            <span class="asd-progress-label">0%</span>
+                        </div>
+                        <span class="asd-speed" title="Megabytes per second">0.00 MB/s</span>
                         <div class="asd-led" style="width: 14px; height: 14px; border-radius: 50%; background-color: red; box-shadow: 0 0 6px red; flex-shrink: 0;" title="Not downloaded"></div>
                         <button class="asd-del-btn" style="background: transparent; border: none; color: #888; cursor: pointer; padding: 0px 4px; font-size: 14px;">❌</button>
                     `;

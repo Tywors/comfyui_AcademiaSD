@@ -9,6 +9,7 @@ import math
 import subprocess
 import sys
 import tempfile
+import time
 import shutil
 from server import PromptServer
 from aiohttp import web
@@ -20,6 +21,15 @@ HEADERS = {
 
 ACTIVE_DOWNLOADS = {}
 DOWNLOAD_ERRORS = {}
+
+
+def parse_cli_speed(line):
+    """Convert the CLI's byte rate (SI or IEC units) to bytes per second."""
+    match = re.search(r'([0-9]+(?:\.[0-9]+)?)\s*([kKMGT]?)(i?)B/s', line)
+    if not match:
+        return None
+    power = {'': 0, 'K': 1, 'M': 2, 'G': 3, 'T': 4}[match.group(2).upper()]
+    return float(match.group(1)) * (1024 if match.group(3) else 1000) ** power
 
 
 def find_hf_cli():
@@ -77,7 +87,8 @@ def background_hf_cli_task(url, file_path, hf_token='', cli_command=None):
                     if char in '\r\n':
                         match = re.search(r'(\d{1,3})%\|', line)
                         if match:
-                            ACTIVE_DOWNLOADS[url] = {'progress': min(99, int(match.group(1))), 'method': 'cli'}
+                            ACTIVE_DOWNLOADS[url] = {'progress': min(99, int(match.group(1))), 'method': 'cli',
+                                                     'speed_bps': parse_cli_speed(line), 'updated_at': time.monotonic()}
                         line = ''
                     else:
                         line = (line + char)[-4096:]
@@ -230,14 +241,21 @@ def background_download_task(url, file_path, civitai_token="", hf_token=""):  # 
             total_length = r.headers.get('content-length')
             total_length = int(total_length) if total_length else 0
             downloaded = 0
+            sample_time, sample_bytes, speed = time.monotonic(), 0, 0.0
             
             with open(temp_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=1024*1024): 
                     if chunk:
                         f.write(chunk)
                         downloaded += len(chunk)
-                        if total_length > 0:
-                            ACTIVE_DOWNLOADS[url] = {"progress": int((downloaded / total_length) * 100)}
+                        now = time.monotonic()
+                        if now - sample_time >= 0.5:
+                            speed = (downloaded - sample_bytes) / (now - sample_time)
+                            sample_time, sample_bytes = now, downloaded
+                        ACTIVE_DOWNLOADS[url] = {
+                            "progress": min(99, int(downloaded / total_length * 100)) if total_length else -1,
+                            "speed_bps": speed, "updated_at": now,
+                        }
         
         os.replace(temp_path, file_path)
     except Exception as e:
@@ -370,7 +388,12 @@ async def check_file(request):
     if not url or url == "none": return web.json_response({"status": "error", "exists": False})
 
     if url in ACTIVE_DOWNLOADS:
-        return web.json_response({"status": "success", "exists": False, "is_downloading": True, "progress": ACTIVE_DOWNLOADS[url].get("progress", -1)})
+        state = ACTIVE_DOWNLOADS.get(url, {})
+        speed = state.get("speed_bps")
+        if time.monotonic() - state.get("updated_at", 0) > 3:
+            speed = 0
+        return web.json_response({"status": "success", "exists": False, "is_downloading": True,
+                                  "progress": state.get("progress", -1), "speed_bps": speed})
 
     if url in DOWNLOAD_ERRORS:
         return web.json_response({"status": "error", "exists": False, "is_downloading": False, "message": DOWNLOAD_ERRORS[url]})
