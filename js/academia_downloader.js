@@ -54,7 +54,7 @@ app.registerExtension({
             nodeType.prototype.onNodeCreated = function () {
                 if (onNodeCreated) onNodeCreated.apply(this, arguments);
 
-                const MIN_WIDTH = 850;
+                const MIN_WIDTH = 950;
                 this.size = [950, 200];
                 let folders = [];
                 let currentPreset = "default";
@@ -206,6 +206,13 @@ app.registerExtension({
                              sizeLabel.innerText = newSize;
                         }
 
+                        const cli = row.querySelector(".asd-cli-btn");
+                        const progress = row.querySelector(".asd-progress");
+                        cli.disabled = Boolean(data.exists || data.is_downloading);
+                        progress.hidden = !(data.exists || data.is_downloading);
+                        if (data.exists) progress.value = 100;
+                        else if (data.is_downloading && data.progress > 0) progress.value = data.progress;
+                        else progress.removeAttribute("value");
                         if (data.exists) {
                             led.style.backgroundColor = "#00ff00"; led.title = `Ready: ${data.filename}`;
                             btn.innerText = "Completed"; btn.disabled = true; btn.style.background = "#008800";
@@ -216,6 +223,9 @@ app.registerExtension({
                         } else if (data.message === "auth_required") {
                             led.style.backgroundColor = "#ff00ff"; led.title = "API Key Required";
                             btn.innerText = "Need Token"; btn.disabled = false; btn.style.background = "#aa00aa";
+                        } else if (data.status === "error" && data.message) {
+                            led.style.backgroundColor = "red"; led.title = data.message;
+                            btn.innerText = "Retry"; btn.disabled = false; btn.style.background = "#883333";
                         } else {
                             led.style.backgroundColor = "red"; led.title = "Not downloaded";
                             btn.innerText = "Download"; btn.disabled = false; btn.style.background = "#225588";
@@ -224,22 +234,63 @@ app.registerExtension({
                     } catch (e) { led.style.backgroundColor = "red"; }
                 };
 
-                const downloadRow = async (row) => {
-                    const payload = getRowPayload(row);
-                    if(!payload.url || payload.url === "none") return;
-                    
-                    const led = row.querySelector(".asd-led");
+                const showHfInstallDialog = () => {
+                    const dialog = document.createElement("dialog");
+                    dialog.style.cssText = "max-width: 440px; padding: 24px; color: #eee; background: #222; border: 1px solid #666; border-radius: 8px; font: 14px/1.5 sans-serif;";
+                    dialog.innerHTML = `
+                        <h3 style="margin-top: 0;">Cliente de Hugging Face no disponible</h3>
+                        <p>El botón «cli» utiliza el cliente oficial de Hugging Face, que puede acelerar la descarga de modelos. Es opcional y no se instala automáticamente.</p>
+                        <p><a href="https://huggingface.co/docs/huggingface_hub/en/guides/cli#getting-started" target="_blank" rel="noopener noreferrer" style="color: #8bc5ff;">Ver instrucciones oficiales de instalación</a></p>
+                        <p>Si lo instalas, reinicia ComfyUI para que pueda detectarlo. También puedes seguir usando «Download» sin instalar nada.</p>
+                        <form method="dialog"><button class="asd-btn" autofocus>Cerrar</button></form>
+                    `;
+                    dialog.addEventListener("close", () => dialog.remove(), { once: true });
+                    document.body.appendChild(dialog);
+                    dialog.showModal();
+                };
+
+                const downloadRow = async (row, method = "http") => {
+                    if (row.downloadBusy) return;
+                    const payload = { ...getRowPayload(row), method };
+                    if (!payload.url || payload.url === "none") return;
+                    row.downloadBusy = true;
                     const btn = row.querySelector(".asd-dl-btn");
-                    btn.innerText = "⏳ Starting..."; btn.disabled = true; btn.style.background = "#555";
-                    led.style.backgroundColor = "yellow";
-                    
+                    const cli = row.querySelector(".asd-cli-btn");
+                    const progress = row.querySelector(".asd-progress");
+                    btn.innerText = "⏳ Starting...";
+                    btn.disabled = cli.disabled = true;
+                    progress.hidden = false;
+                    progress.removeAttribute("value");
                     try {
-                        await fetch("/academia/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-                        const poll = setInterval(async () => {
+                        const response = await fetch("/academia/download", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+                        const result = await response.json();
+                        if (result.code === "hf_cli_missing") {
+                            row.downloadBusy = false;
+                            btn.disabled = cli.disabled = false;
+                            btn.innerText = "Download";
+                            progress.hidden = true;
+                            showHfInstallDialog();
+                            return;
+                        }
+                        if (!response.ok || result.status === "error") throw new Error(result.message || "Download failed");
+                        const poll = async () => {
+                            if (!row.isConnected) { row.downloadBusy = false; return; }
                             const data = await checkRowStatus(row);
-                            if(data && data.exists && !data.is_downloading) clearInterval(poll);
-                        }, 3000);
-                    } catch (e) {}
+                            if (data?.is_downloading) setTimeout(poll, 1000);
+                            else {
+                                row.downloadBusy = false;
+                                if (!data) { btn.disabled = cli.disabled = false; progress.hidden = true; }
+                            }
+                        };
+                        await poll();
+                    } catch (e) {
+                        row.downloadBusy = false;
+                        btn.disabled = cli.disabled = false;
+                        btn.innerText = "Retry";
+                        progress.hidden = true;
+                        row.querySelector(".asd-led").title = e.message;
+                        alert(e.message);
+                    }
                 };
 
                 let draggedRow = null;
@@ -284,6 +335,8 @@ app.registerExtension({
                         </select>
                         <input type="text" class="subfolder-input asd-input" placeholder="Subfolder" value="${savedSubfolder}" style="flex: 1;">
                         <button class="asd-btn asd-dl-btn" style="background: #225588;">Download</button>
+                        <button class="asd-btn asd-cli-btn" title="Download using Hugging Face CLI">cli</button>
+                        <progress class="asd-progress" max="100" hidden style="width: 65px; flex-shrink: 0;" aria-label="Download progress"></progress>
                         <div class="asd-led" style="width: 14px; height: 14px; border-radius: 50%; background-color: red; box-shadow: 0 0 6px red; flex-shrink: 0;" title="Not downloaded"></div>
                         <button class="asd-del-btn" style="background: transparent; border: none; color: #888; cursor: pointer; padding: 0px 4px; font-size: 14px;">❌</button>
                     `;
@@ -308,6 +361,7 @@ app.registerExtension({
                     });
 
                     row.querySelector(".asd-dl-btn").addEventListener("click", () => downloadRow(row));
+                    row.querySelector(".asd-cli-btn").addEventListener("click", () => downloadRow(row, "cli"));
 
                     const handleUrlFetch = async (isRestoringCall = false) => {
                         const url = row.querySelector(".url-input").value;

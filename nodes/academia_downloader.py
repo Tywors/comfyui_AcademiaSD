@@ -6,6 +6,10 @@ import urllib.parse
 import re
 import json
 import math
+import subprocess
+import sys
+import tempfile
+import shutil
 from server import PromptServer
 from aiohttp import web
 import folder_paths
@@ -15,6 +19,76 @@ HEADERS = {
 }
 
 ACTIVE_DOWNLOADS = {}
+DOWNLOAD_ERRORS = {}
+
+
+def find_hf_cli():
+    """Find a working optional CLI without importing or installing dependencies."""
+    candidates = []
+    executable = shutil.which('hf')
+    if executable:
+        candidates.append([executable])
+    candidates.append([sys.executable, '-c',
+                       'import sys; sys.stderr.isatty = lambda: True; '
+                       'from huggingface_hub.cli.hf import main; main()'])
+    for command in candidates:
+        try:
+            result = subprocess.run(command + ['download', '--help'],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=15, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            if result.returncode == 0:
+                return command
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+def parse_hf_file_url(url):
+    parsed = urllib.parse.urlparse(url)
+    parts = parsed.path.strip('/').split('/')
+    if parsed.scheme != 'https' or parsed.hostname != 'huggingface.co' or len(parts) < 5 or parts[2] not in ('resolve', 'blob'):
+        raise ValueError('cli requires a Hugging Face file URL (resolve/blob), or a selected repository file.')
+    repo_id = '/'.join(parts[:2])
+    revision = urllib.parse.unquote(parts[3])
+    filename = urllib.parse.unquote('/'.join(parts[4:]))
+    if any(p in ('', '.', '..') or ':' in p for p in filename.replace('\\', '/').split('/')):
+        raise ValueError('Invalid Hugging Face file path.')
+    return repo_id, revision, filename
+
+
+def background_hf_cli_task(url, file_path, hf_token='', cli_command=None):
+    """Run the detected official CLI, forwarding tqdm progress."""
+    try:
+        repo_id, revision, filename = parse_hf_file_url(url)
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        env = os.environ.copy()
+        if hf_token:
+            env['HF_TOKEN'] = hf_token
+        env['HF_HUB_DISABLE_PROGRESS_BARS'] = '0'
+        env['PYTHONIOENCODING'] = 'utf-8'
+        # Same volume for atomic publication; nested repository paths stay private.
+        with tempfile.TemporaryDirectory(prefix='.academia-hf-', dir=os.path.dirname(file_path)) as staging:
+            command = cli_command + ['download', repo_id, filename, '--revision', revision, '--local-dir', staging]
+            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)) as process:
+                line = ''
+                for byte in iter(lambda: process.stdout.read(1), b''):
+                    char = byte.decode('utf-8', errors='replace')
+                    if char in '\r\n':
+                        match = re.search(r'(\d{1,3})%\|', line)
+                        if match:
+                            ACTIVE_DOWNLOADS[url] = {'progress': min(99, int(match.group(1))), 'method': 'cli'}
+                        line = ''
+                    else:
+                        line = (line + char)[-4096:]
+                if process.wait() != 0:
+                    raise RuntimeError('HF CLI failed. Check Hugging Face access/token and connection.')
+            source = os.path.join(staging, *filename.split('/'))
+            os.replace(source, file_path)
+    except Exception as exc:
+        DOWNLOAD_ERRORS[url] = str(exc).replace(hf_token, '[token]') if hf_token else str(exc)
+    finally:
+        ACTIVE_DOWNLOADS.pop(url, None)
 
 # Una sesion HTTP por hilo. Reutiliza la conexion entre las varias peticiones que
 # hace cada descarga (comprobar cabeceras, seguir redirecciones, bajar el fichero)
@@ -167,6 +241,7 @@ def background_download_task(url, file_path, civitai_token="", hf_token=""):  # 
         
         os.replace(temp_path, file_path)
     except Exception as e:
+        DOWNLOAD_ERRORS[url] = 'Download failed. Check the URL, access token and connection.'
         if os.path.exists(temp_path): os.remove(temp_path)
     finally:
         ACTIVE_DOWNLOADS.pop(url, None)
@@ -186,6 +261,10 @@ def _read_tokens():
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _resolve_token(value, provider):
+    return _read_tokens().get(provider, '') if value == TOKEN_MASK else value
 
 
 @PromptServer.instance.routes.get("/academia/tokens")
@@ -263,7 +342,7 @@ async def get_folders(request):
 async def parse_url(request):
     data = await request.json()
     url = data.get("url", "")
-    hf_token = data.get("hf_token", "")
+    hf_token = _resolve_token(data.get("hf_token", ""), 'huggingface')
     if "huggingface.co" in url and "/resolve/" not in url and "/blob/" not in url:
         match = re.search(r"huggingface\.co/([^/]+/[^/?#]+)(?:/tree/([^/?#]+))?", url)
         if match:
@@ -292,6 +371,9 @@ async def check_file(request):
 
     if url in ACTIVE_DOWNLOADS:
         return web.json_response({"status": "success", "exists": False, "is_downloading": True, "progress": ACTIVE_DOWNLOADS[url].get("progress", -1)})
+
+    if url in DOWNLOAD_ERRORS:
+        return web.json_response({"status": "error", "exists": False, "is_downloading": False, "message": DOWNLOAD_ERRORS[url]})
 
     filename = os.path.basename(filename_hint) if filename_hint else ""
     filesize = "Unknown"
@@ -329,6 +411,20 @@ async def download_file(request):
     folder, subfolder = data.get("folder"), data.get("subfolder", "").strip()
     filename = data.get("filename", "").strip()
     civ_t, hf_t = data.get("civitai_token", "").strip(), data.get("hf_token", "").strip()
+    civ_t, hf_t = _resolve_token(civ_t, 'civitai'), _resolve_token(hf_t, 'huggingface')
+    method = data.get('method', 'http')
+    if method not in ('http', 'cli'):
+        return web.json_response({'status': 'error', 'message': 'Invalid download method.'}, status=400)
+    if method == 'cli':
+        cli_command = await asyncio.to_thread(find_hf_cli)
+        if cli_command is None:
+            return web.json_response({'status': 'error', 'code': 'hf_cli_missing'}, status=400)
+        try:
+            _, _, hf_filename = parse_hf_file_url(url)
+        except ValueError as exc:
+            return web.json_response({'status': 'error', 'message': str(exc)}, status=400)
+        if not filename or filename in ('Direct Link', 'Pending...'):
+            filename = hf_filename.split('/')[-1]
     
     if not url: return web.json_response({"status": "error", "message": "Invalid URL."})
     if url in ACTIVE_DOWNLOADS: return web.json_response({"status": "started", "message": "Already downloading."})
@@ -346,8 +442,12 @@ async def download_file(request):
         return web.json_response({"status": "error", "message": "Invalid destination folder."}, status=400)
 
     file_path = os.path.join(destino, filename)
+    DOWNLOAD_ERRORS.pop(url, None)
     ACTIVE_DOWNLOADS[url] = {"progress": 0}
-    asyncio.create_task(asyncio.to_thread(background_download_task, url, file_path, civ_t, hf_t))
+    if method == 'cli':
+        asyncio.create_task(asyncio.to_thread(background_hf_cli_task, url, file_path, hf_t, cli_command))
+    else:
+        asyncio.create_task(asyncio.to_thread(background_download_task, url, file_path, civ_t, hf_t))
     
     return web.json_response({"status": "started"})
 
